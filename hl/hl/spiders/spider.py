@@ -75,7 +75,6 @@ class SkuSpider(scrapy.Spider):
         self.driver = webdriver.Chrome(options=options)
         self.driver.set_window_size(1920, 1080)
         self.driver.implicitly_wait(5)
-
     def parse(self, response):
         try:
             self.driver.get(response.url)
