@@ -133,7 +133,8 @@ PLAYWRIGHT_LAUNCH_OPTIONS = {
 }
 
 # Playwright 上下文设置
-PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 30000  # 30秒
+# 将这一行修改为与spider中一致
+PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = 60000  # 60秒
 PLAYWRIGHT_CONTEXTS = {
     "default": {
         "viewport": {"width": 1920, "height": 1080},

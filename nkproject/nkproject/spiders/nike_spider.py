@@ -1,46 +1,84 @@
 import asyncio
 import json
 from urllib.parse import urljoin
+from datetime import datetime
 
 import scrapy
-
-import scrapy
-import asyncio
-from urllib.parse import urljoin
+from scrapy import Request
 
 
 class NikeSpider(scrapy.Spider):
     name = "nike_products"
     start_urls = ['https://www.nike.com.cn/w/']
 
-    # 自定义设置，覆盖 settings.py 中的部分配置
+    # 自定义设置
+    # 自定义设置
     custom_settings = {
         'DOWNLOAD_TIMEOUT': 90,
         'PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT': 60000,
+        # 确保使用所有管道
+        'ITEM_PIPELINES': {
+            'nkproject.pipelines.NkprojectPipeline': 300,
+            'nkproject.pipelines.DataValidationPipeline': 400,
+            'nkproject.pipelines.DuplicatesPipeline': 500,
+            'nkproject.pipelines.StatsPipeline': 600,
+        },
+        # 其他设置保持不变
     }
 
     def start_requests(self):
         for url in self.start_urls:
-            yield scrapy.Request(
+            yield Request(
                 url,
                 meta={
                     'playwright': True,
                     'playwright_include_page': True,
                     'playwright_context': 'default',
                     'playwright_page_goto_kwargs': {
-                        'wait_until': 'domcontentloaded',  # 等待 DOM 加载完成
+                        'wait_until': 'domcontentloaded',
                         'timeout': 60000,
                     },
                 },
                 callback=self.parse,
-                dont_filter=True,  # 允许重复请求（如果需要重试）
+                dont_filter=True,
             )
 
-    async def parse(self, response):
-        page = response.meta['playwright_page']
+    def parse(self, response):
+        """修改为同步方法，使用 playwright_page_coroutine"""
+        page = response.meta.get('playwright_page')
+
+        if not page:
+            self.logger.error("未获取到 playwright_page")
+            return self._create_error_result(response.url, "未获取到页面对象")
 
         try:
             self.logger.info(f"开始处理页面: {response.url}")
+
+            # 创建异步处理的 Request，让 Playwright 处理异步逻辑
+            return Request(
+                response.url,
+                meta={
+                    'playwright': True,
+                    'playwright_include_page': True,
+                    'playwright_context': 'default',
+                    'playwright_page_coroutine': self._async_process_page,
+                    'playwright_page_goto_kwargs': {
+                        'wait_until': 'domcontentloaded',
+                        'timeout': 60000,
+                    },
+                },
+                callback=self.parse_result,
+                dont_filter=True,
+            )
+
+        except Exception as e:
+            self.logger.error(f"处理页面时出错: {e}")
+            yield self._create_error_result(response.url, str(e))
+
+    async def _async_process_page(self, page):
+        """异步处理页面的协程"""
+        try:
+            self.logger.info("开始异步处理页面")
 
             # 1. 等待页面完全加载
             await self._wait_for_page_load(page)
@@ -51,31 +89,33 @@ class NikeSpider(scrapy.Spider):
             # 3. 获取最终页面内容
             body = await page.content()
 
-            self.logger.info(f"页面处理完成，准备解析数据")
+            self.logger.info(f"异步处理完成，总链接数: {total_links}")
+            return body
 
         except asyncio.TimeoutError as e:
             self.logger.error(f"页面加载超时: {e}")
-            yield self._create_error_result(response.url, "页面加载超时")
-            return
+            raise
         except Exception as e:
-            self.logger.error(f"页面处理出错: {e}")
-            yield self._create_error_result(response.url, str(e))
-            return
-        finally:
-            # 确保页面被关闭
-            try:
-                await page.close()
-                self.logger.debug("页面已关闭")
-            except Exception as e:
-                self.logger.warning(f"关闭页面时出错: {e}")
+            self.logger.error(f"异步处理出错: {e}")
+            raise
 
-        # 解析数据
+    def parse_result(self, response):
+        """解析最终结果"""
         try:
+            # 获取页面内容（由异步协程处理后的结果）
+            body = response.text
+
+            # 解析产品链接
             result = self._parse_product_links(body, response.url)
+
+            self.logger.info(f"成功解析 {result['link_count']} 个产品链接")
+
+            # 返回结果 - 这里会被 pipeline 处理
             yield result
+
         except Exception as e:
-            self.logger.error(f"数据解析出错: {e}")
-            yield self._create_error_result(response.url, f"数据解析错误: {e}")
+            self.logger.error(f"解析结果时出错: {e}")
+            yield self._create_error_result(response.url, f"解析错误: {e}")
 
     async def _wait_for_page_load(self, page):
         """等待页面加载完成"""
@@ -87,7 +127,7 @@ class NikeSpider(scrapy.Spider):
             '[data-testid="product-grid"]',
             '.product-card',
             '.grid-item',
-            'main',  # 备用选择器
+            'main',
         ]
 
         page_loaded = False
@@ -111,9 +151,9 @@ class NikeSpider(scrapy.Spider):
         """执行滚动加载内容"""
         self.logger.info("开始滚动加载内容...")
 
-        max_scrolls = 5  # 增加滚动次数
-        no_change_count = 0  # 连续无变化次数
-        max_no_change = 2  # 最大连续无变化次数
+        max_scrolls = 5
+        no_change_count = 0
+        max_no_change = 2
 
         for i in range(max_scrolls):
             try:
@@ -131,57 +171,27 @@ class NikeSpider(scrapy.Spider):
                     });
                 """)
 
-                # 等待滚动完成
-                await asyncio.sleep(2)
+                # 等待滚动完成和新内容加载
+                await asyncio.sleep(3)
 
-                # 等待新内容加载
-                max_wait_time = 10  # 最大等待时间（秒）
-                waited_time = 0
-
-                while waited_time < max_wait_time:
-                    await asyncio.sleep(1)
-                    waited_time += 1
-
-                    # 检查页面是否有变化
-                    current_height = await page.evaluate("document.body.scrollHeight")
-                    current_links = await self._count_product_links(page)
-
-                    if current_height > prev_height or current_links > prev_links:
-                        self.logger.info(
-                            f"检测到新内容: 高度 {prev_height}→{current_height}, 链接 {prev_links}→{current_links}")
-                        no_change_count = 0
-                        break
-
-                    # 检查是否已经到达页面底部
-                    at_bottom = await page.evaluate("""
-                        window.innerHeight + window.scrollY >= document.body.scrollHeight - 100
-                    """)
-
-                    if at_bottom and waited_time > 3:
-                        self.logger.info("已滚动到页面底部")
-                        break
-
-                # 如果没有新内容加载
+                # 检查页面变化
                 current_height = await page.evaluate("document.body.scrollHeight")
                 current_links = await self._count_product_links(page)
 
                 if current_height == prev_height and current_links == prev_links:
                     no_change_count += 1
-                    self.logger.info(f"第 {i + 1} 次滚动无新内容 (连续 {no_change_count} 次)")
-
                     if no_change_count >= max_no_change:
                         self.logger.info("连续多次无新内容，停止滚动")
                         break
                 else:
                     no_change_count = 0
 
-                self.logger.info(f"第 {i + 1} 次滚动完成")
+                self.logger.info(f"第 {i + 1} 次滚动完成: 高度={current_height}, 链接数={current_links}")
 
             except Exception as e:
                 self.logger.error(f"第 {i + 1} 次滚动出错: {e}")
                 continue
 
-        # 获取最终链接数
         final_links = await self._count_product_links(page)
         self.logger.info(f"滚动完成，最终链接数: {final_links}")
         return final_links
@@ -189,7 +199,6 @@ class NikeSpider(scrapy.Spider):
     async def _count_product_links(self, page):
         """统计产品链接数量"""
         try:
-            # 尝试多种选择器
             selectors = [
                 'div[id="skip-to-products"] a[href]',
                 '[data-testid="product-grid"] a[href]',
@@ -205,7 +214,6 @@ class NikeSpider(scrapy.Spider):
                 except:
                     continue
 
-            # 如果都没找到，返回所有链接数
             return await page.evaluate('document.querySelectorAll("a[href]").length')
 
         except Exception as e:
@@ -221,7 +229,7 @@ class NikeSpider(scrapy.Spider):
             selector.xpath('//div[@id="skip-to-products"]'),
             selector.css('[data-testid="product-grid"]'),
             selector.css('.product-grid'),
-            selector,  # 整个页面作为备用
+            selector,
         ]
 
         all_links = []
@@ -240,7 +248,6 @@ class NikeSpider(scrapy.Spider):
         valid_links = []
         seen = set()
 
-        # 产品页面的URL模式
         product_patterns = [
             '/product/',
             '/shoes/',
@@ -256,12 +263,9 @@ class NikeSpider(scrapy.Spider):
             if not link or link in seen:
                 continue
 
-            # 构建完整URL
             full_url = urljoin(base_url, link)
 
-            # 过滤有效的产品链接
             if any(pattern in full_url.lower() for pattern in product_patterns):
-                # 进一步过滤，排除一些非产品页面
                 if not any(exclude in full_url.lower() for exclude in ['help', 'size-guide', 'reviews', 'wishlist']):
                     valid_links.append(full_url)
                     seen.add(link)
@@ -273,7 +277,7 @@ class NikeSpider(scrapy.Spider):
             "product_links": valid_links,
             "link_count": len(valid_links),
             "total_links_found": len(all_links),
-            "timestamp": scrapy.utils.misc.load_object("datetime").datetime.now().isoformat(),
+            "timestamp": datetime.now().isoformat(),
             "status": "success"
         }
 
@@ -285,56 +289,78 @@ class NikeSpider(scrapy.Spider):
             "link_count": 0,
             "total_links_found": 0,
             "error": error_msg,
-            "timestamp": scrapy.utils.misc.load_object("datetime").datetime.now().isoformat(),
+            "timestamp": datetime.now().isoformat(),
             "status": "error"
         }
 
 
-def init():
-    with open('nike_links.json', 'r', encoding='utf-8') as file:
-        data = json.load(file)
-        return [
-            url
-            for item in data
-            for url in item["product_links"]
-        ]
-
-
 class SkuSpider(scrapy.Spider):
     name = "sku_products"
-    start_urls = init()
-    print(start_urls)
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_urls = self._load_product_urls()
 
+    def _load_product_urls(self):
+        """从文件加载产品URL"""
+        try:
+            with open('data/nike_products.json', 'r', encoding='utf-8') as file:
+                data = json.load(file)
+                # 处理不同的数据格式
+                if isinstance(data, list):
+                    urls = []
+                    for item in data:
+                        if isinstance(item, dict) and 'product_links' in item:
+                            urls.extend(item['product_links'])
+                    return urls
+                return []
+        except FileNotFoundError:
+            self.logger.error("nike_products.json 文件不存在，请先运行 nike_products 爬虫")
+            return []
+        except Exception as e:
+            self.logger.error(f"加载产品URL失败: {e}")
+            return []
 
     def parse(self, response):
-        title_container = response.xpath('//*[@id="title-container"]')
+        """解析产品详情页"""
+        try:
+            title_container = response.xpath('//*[@id="title-container"]')
+            title = title_container.xpath('//h1[@data-testid="product_title"]/text()').get()
+            subtitle = title_container.xpath('//h2[@data-testid="product_subtitle"]/text()').get()
 
-        title = title_container.xpath('//h1[@data-testid="product_title"]/text()').get().strip()
-        subtitle = title_container.xpath('//h2[@data-testid="product_subtitle"]/text()').get().strip()
+            price_container = response.xpath('//*[@id="price-container"]')
+            price = price_container.xpath('//span[@data-testid="currentPrice-container"]/text()').get()
 
-        price_container = response.xpath('//*[@id="price-container"]')
-        price = price_container.xpath('//span[@data-testid="currentPrice-container"]/text()').get().strip()
+            description_container = response.xpath('//*[@id="product-description-container"]')
+            detail = description_container.xpath('//p/text()').get()
 
-        description_container = response.xpath('//*[@id="product-description-container"]')
-        detail = description_container.xpath('//*[@id="product-description-container"]/p/text()').get().strip()
+            color = description_container.xpath(
+                'normalize-space(//li[@data-testid="product-description-color-description"])'
+            ).re_first(r'：(.+)$')
 
-        color = description_container.xpath(
-            'normalize-space(//li[@data-testid="product-description-color-description"])').re_first(r'：(.+)$'),
-        sku = description_container.xpath(
-            'normalize-space(//li[@data-testid="product-description-style-color"])').re_first(r'：(.+)$')
+            sku = description_container.xpath(
+                'normalize-space(//li[@data-testid="product-description-style-color"])'
+            ).re_first(r'：(.+)$')
 
-        size = response.xpath('//input[@name="grid-selector-input"]/@value').getall()
-        img_urls = response.xpath(
-            '//img[@data-testid="HeroImg"]/@src'
-        ).getall()
+            size = response.xpath('//input[@name="grid-selector-input"]/@value').getall()
+            img_urls = response.xpath('//img[@data-testid="HeroImg"]/@src').getall()
 
-        yield {
-            'title': f"{title} | {subtitle}",
-            'price': price,
-            'color': color,
-            'size': size,
-            'sku': sku,
-            'details': detail,
-            'img_urls': img_urls
-        }
+            yield {
+                'url': response.url,
+                'title': f"{title or ''} | {subtitle or ''}".strip(' |'),
+                'price': price.strip() if price else '',
+                'color': color,
+                'size': size,
+                'sku': sku,
+                'details': detail.strip() if detail else '',
+                'img_urls': img_urls,
+                'timestamp': datetime.now().isoformat(),
+            }
+
+        except Exception as e:
+            self.logger.error(f"解析产品页面失败 {response.url}: {e}")
+            yield {
+                'url': response.url,
+                'error': str(e),
+                'timestamp': datetime.now().isoformat(),
+            }

@@ -26,8 +26,9 @@ class NkprojectSpiderMiddleware:
     def process_spider_input(self, response, spider):
         return None
 
-    def process_spider_output(self, response, result, spider):
-        for i in result:
+    # 修改为异步生成器方法
+    async def process_spider_output(self, response, result, spider):
+        async for i in result:
             yield i
 
     def process_spider_exception(self, response, exception, spider):
