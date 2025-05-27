@@ -1,1 +1,0 @@
-scrapy crawl nike_products -O nike.json
